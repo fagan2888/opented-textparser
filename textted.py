@@ -10,9 +10,15 @@ from datetime import datetime
 START_DOC = re.compile(r'^(\d+\.\d+)/(\d+)')
 START_SECTION = re.compile(r'^([A-Z]{2}): ')
 START_SUBSECTION = re.compile(r'^\s*(\d{1,2})\.')
+START_TX_SECTION = re.compile(r'SECTION ([IVX]+):')
+START_TX_SUBSECTION = re.compile(r'^\s*([IVX]+\.\d+)\)')
 START_SUBSUBSECTION = re.compile(r'^\s*[a-z]\)')
 TI_RE = re.compile(r'^\s*(\w{1,2})-(\w+): (.*)')
 CONTRACTOR_ADDRESS = re.compile(r'(.+), ?([A-Z]{1,2})\-([A-Z0-9]+) +(.{2,})$')
+AMOUNT = r'((?:[\d ])*(?:\.,\d{1,2})?) ?([A-Z]{2,3})'
+AMOUNT_RE = re.compile(AMOUNT)
+VALUE_RE = re.compile(r'^Value: %s\.?' % AMOUNT)
+VAT_RE = re.compile(r'VAT rate \(%\) ([\d\.,]+)\b')
 
 PRICE_RES = [
     re.compile(r'(?P<value>(\d+\s)+(?:[\.\,]\d+)?) ?(?P<currency>[A-Z]{,3})?'),
@@ -20,8 +26,6 @@ PRICE_RES = [
 ]
 
 MAPPING = {
-    'TX_11': 'contract_additional_information',
-    'TX_1': 'contract_authority_address',
     'CY': 'contract_authority_country',
     'TW': 'contract_authority_town',
     'DI': 'document_directive',
@@ -122,15 +126,109 @@ class TextTedParser(object):
             data[0] = data[0].split(':', 1)[1]
         except (ValueError, IndexError):
             pass
-        return ' '.join(data)
+        return ' '.join(data).strip()
+
+    def _parse_date(self, data):
+        data = ' '.join(data)
+        raw_date = data.replace(' ', '').strip()
+        if raw_date.endswith('.'):
+            raw_date = raw_date[:-1].strip()
+        try:
+            return datetime.strptime(raw_date, '%d.%m.%Y').strftime('%Y-%m-%d')
+        except ValueError:
+            return ''
+
+    def _parse_bool(self, val):
+        if val in ('Yes',):
+            return True
+        if val in ('No',):
+            return False
+        return None
+
+    def _parse_int(self, val):
+        val = val.replace('.', '').strip()
+        try:
+            return int(val)
+        except ValueError:
+            return None
+
+    def _parse_amount(self, value):
+        value = value.replace(' ', '')
+        value = re.sub(r'[\.,](\d{3})', '\\1', value)
+        value = value.replace(',', '.')
+        try:
+            return float(value)
+        except ValueError:
+            return None
+
+    def _parse_money(self, value):
+        match = AMOUNT_RE.search(value)
+        if match is None:
+            return None
+        return {
+            'value': self._parse_amount(match.group(1)),
+            'currency': match.group(2)
+        }
+
+    def _parse_address(self, data):
+        match = CONTRACTOR_ADDRESS.search(data)
+        if match is not None:
+            name_address = match.group(1)
+            country = match.group(2)
+            postcode = match.group(3)
+            town = match.group(4)
+            if ',' in name_address:
+                name, address = name_address.split(',', 1)
+            else:
+                name = name_address
+                address = ''
+
+            return {
+                'contract_operator_official_name': name,
+                'contract_operator_address': address,
+                'contract_operator_postal_code': postcode,
+                'contract_operator_town': town,
+                'contract_operator_country': country,
+            }
+        return {
+            'contract_operator_official_name': data,
+            'contract_operator_address': '',
+            'contract_operator_postal_code': '',
+            'contract_operator_town': '',
+            'contract_operator_country': ''
+        }
+
+    def _parse_contract_value(self, data, possible_values):
+        values = defaultdict(dict)
+        current_key = None
+        for line in data:
+            matches = [k for k, v in possible_values.items() if v in line]
+            if matches:
+                current_key = matches[0]
+            if current_key:
+                value_match = VALUE_RE.search(line)
+                if value_match is not None:
+                    money_value = self._parse_amount(value_match.group(1))
+                    values[current_key]['value'] = money_value
+                    currency = value_match.group(2)
+                    values[current_key]['currency'] = currency
+                    continue
+                if 'Excluding VAT' in line:
+                    values[current_key]['vat'] = False
+                    continue
+                vat_match = VAT_RE.search(line)
+                if vat_match is not None:
+                    values[current_key]['vat'] = self._parse_amount(vat_match.group(1))
+                    continue
+        return values
 
     def parse_TI(self, data):
         match = TI_RE.search(data[0])
         if match:
             return {
                 'document_title_country': match.group(1),
-                'document_title_text': '%s %s' % (
-                    match.group(3), ' '.join(data[1:])),
+                'document_title_text': ('%s %s' % (
+                    match.group(3), ' '.join(data[1:]))).strip(),
                 'document_title_town': match.group(2)
             }
         return {
@@ -205,38 +303,127 @@ class TextTedParser(object):
             'document_oj_date': date[1]
         }
 
+    def parse_OT(self, data):
+        # Original language text, discard
+        return {}
+
     def parse_CO(self, data):
         data = self._parse_simple_value(data)
-        match = CONTRACTOR_ADDRESS.search(data)
-        if match is not None:
-            name_address = match.group(1)
-            country = match.group(2)
-            postcode = match.group(3)
-            town = match.group(4)
-            if ',' in name_address:
-                name, address = name_address.split(',', 1)
-            else:
-                name = name_address
-                address = ''
-
-            return {
-                'contract_operator_official_name': name,
-                'contract_operator_address': address,
-                'contract_operator_postal_code': postcode,
-                'contract_operator_town': town,
-                'contract_operator_country': country,
-            }
-        return {
-            'contract_operator_official_name': '',
-            'contract_operator_address': '',
-            'contract_operator_postal_code': '',
-            'contract_operator_town': '',
-            'contract_operator_country': ''
-        }
+        return self._parse_address(data)
 
     def parse_TX(self, data):
         if not self.should_parse(self.doc):
             return {'TX': '\n'.join(data)}
+
+        full_text = '\n'.join(data)
+        if len(START_TX_SECTION.findall(full_text)) > 1:
+            return self.parse_new_TX(data)
+        return self.parse_old_TX(data)
+
+    def parse_new_TX(self, data):
+        subsections = defaultdict(list)
+        section = None
+        subsection = None
+        result = {}
+        for line in data:
+            line = line.strip()
+            match = START_TX_SECTION.search(line)
+            if match is not None:
+                section = match.group(1)
+                continue
+            if section is None:
+                continue
+            match = START_TX_SUBSECTION.search(line)
+            if match is not None:
+                if subsection is not None:
+                    self._run_parser_new_TX(
+                        subsections[subsection],
+                        subsection,
+                        result
+                    )
+                    subsections[subsection] = []
+                subsection = match.group(1)
+                line = line[len(match.group(0)):]
+                subsections[subsection].append(line)
+                continue
+            if subsection is None:
+                continue
+            subsections[subsection].append(line)
+
+        if subsection is not None:
+            self._run_parser_new_TX(
+                subsections[subsection],
+                subsection,
+                result
+            )
+        return result
+
+    def _run_parser_new_TX(self, data, subsection, result):
+        method_name = 'parse_new_%s' % subsection.replace('.', '_')
+        if hasattr(self, method_name):
+            method = getattr(self, method_name)
+            new_result = method(data)
+            for key in new_result:
+                if key not in result:
+                    result[key] = []
+                result[key].append(new_result[key])
+        else:
+            result.update({'TX_' + subsection: '\n'.join(data)})
+        return result
+
+    def parse_new_V_1(self, data):
+        return {
+            'contract_awarded_date': self._parse_date(self._parse_simple_value(data)),
+        }
+
+    def parse_new_V_2(self, data):
+        return {
+            'contract_offers_received_num': self._parse_int(self._parse_simple_value(data)),
+        }
+
+    def parse_new_V_5(self, data):
+        return {
+            'subcontractors': self._parse_bool(self._parse_simple_value(data))
+        }
+
+    def parse_new_V_4(self, data):
+        possible_values = {
+            'contract_initial_value': 'Initial estimated total value',
+            'contract_total_value': 'Total final value'
+        }
+        values = self._parse_contract_value(data, possible_values)
+        res = {}
+        for key in possible_values:
+            if key in values:
+                value = values[key]
+                if 'value' in value:
+                    res[key + '_currency'] = value['currency']
+                    res[key + '_cost'] = value['value']
+                    if value['currency'] == 'EUR':
+                        res[key + '_cost_eur'] = value['value']
+                    if 'vat' in value:
+                        if value['vat'] is False:
+                            res[key + '_vat_included'] = False
+                            res[key + '_vat_rate'] = None
+                        else:
+                            res[key + '_vat_included'] = True
+                            res[key + '_vat_rate'] = value['vat']
+        return res
+
+    def _get_label_method(self, label):
+        LABEL_MAPPING = {
+            'Number of tenders received': 'contract_offers_received_num',
+            'Contract number and value': 'contract_value',
+            'Date of award of the contract': 'contract_awarded_date',
+            'Name, address and nationality of successful tenderer': 'contract_operator',
+            'Contracting authority': 'contracting_authority'
+        }
+        for needle in LABEL_MAPPING:
+            if needle in label:
+                return getattr(self, 'parse_old_%s' % LABEL_MAPPING[needle])
+        return None
+
+    def parse_old_TX(self, data):
         subsections = defaultdict(list)
         subsection_name = None
         next_subsection_no = 1
@@ -253,70 +440,46 @@ class TextTedParser(object):
                 if not subsection_name:
                     subsection_name = 'TX_'
                 subsections[subsection_name].append(line)
+
         result = {}
         for subsection in subsections:
             subsection_data = subsections[subsection]
-            if hasattr(self, 'parse_%s' % subsection):
-                method = getattr(self, 'parse_%s' % subsection)
-                result.update(method(subsection_data))
+            label_method = self._get_label_method(subsection_data[0])
+            if label_method is not None:
+                data = self._parse_simple_value(subsection_data)
+                result.update(label_method(data))
             else:
-                result.update({subsection: '\n'.join(subsection_data)})
+                result.update({subsection: subsection_data})
         return result
 
-    def parse_TX_1(self, data):
+    def parse_old_contract_operator(self, data):
+        return self._parse_address(data)
+
+    def parse_old_contract_awarded_date(self, data):
         return {
-            'awarding_authority': self._parse_simple_value(data)
+            'contract_awarded_date': self._parse_date(data)
         }
 
-    def parse_TX_5(self, data):
+    def parse_old_contract_value(self, data):
+        result = self._parse_money(data)
+        if result is None:
+            return {
+                'contract_total_value_cost': None
+            }
         return {
-            'contract_offers_received_num': self._parse_simple_value(data)
+            'contract_total_value_cost': result['value'],
+            'contract_total_value_currency': result['currency'],
         }
 
-    def _parse_price(self, price):
-        return float(price.replace(' ', '').replace(',', '.'))
-
-    def parse_TX_8(self, data):
-        prices = []
-        for price_re in PRICE_RES:
-            prices = price_re.finditer(' '.join(data))
-            for m in prices:
-                price = m.group('value')
-                currency = m.group('currency')
-                price = self._parse_price(price)
-                prices.append((price, currency))
+    def parse_old_contract_offers_received_num(self, data):
         return {
-            'contract_total_value_cost': '',
-            'contract_total_value_cost_eur': '',
-            'contract_total_value_currency': '',
-            'contract_total_value_high': '',
-            'contract_total_value_high_eur': '',
-            'contract_total_value_low': '',
-            'contract_total_value_low_eur': '',
-            'contract_total_value_vat_included': '',
+            'contract_offers_received_num': self._parse_int(data)
         }
 
-    def _parse_date(self, data, key):
-        data = ' '.join(data)
-        if ':' not in data:
-            return {key: ''}
-        raw_date = data.split(':', 1)[1]
-        raw_date = raw_date.replace(' ', '').strip()
-        if raw_date.endswith('.'):
-            raw_date = raw_date[:-1].strip()
-        try:
-            return {key: datetime.strptime(raw_date, '%d.%m.%Y').strftime('%Y-%m-%d')}
-        except ValueError:
-            return {key: ''}
-
-    def parse_TX_11(self, data):
-        return self._parse_date(data, 'tx_11_notice_published')
-
-    def parse_TX_12(self, data):
-        return self._parse_date(data, 'tx_12_notice_postmarked')
-
-    def parse_TX_13(self, data):
-        return self._parse_date(data, 'tx_13_notice_received')
+    def parse_old_contracting_authority(self, data):
+        return {
+            'contract_authority_official_name': self._parse_simple_value(data)
+        }
 
 
 def check_file(filename):
