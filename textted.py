@@ -2,7 +2,6 @@ import os
 import zipfile
 import re
 import sys
-import fnmatch
 import json
 from collections import defaultdict
 from datetime import datetime
@@ -320,29 +319,52 @@ class TextTedParser(object):
         return self._parse_date(data, 'tx_13_notice_received')
 
 
-def get_zip_files(path):
-    for root, dirnames, filenames in os.walk(path):
-        for filename in fnmatch.filter(filenames, 'EN*.ZIP'):
-            yield os.path.join(root, filename)
+def check_file(filename):
+    f = filename.lower()
+    if '/en/' not in f:
+        return False
+    if not f.endswith('.zip'):
+        return False
+    if 'meta' in f:
+        return False
+    both_encodings = ['/%s/' % x in f for x in range(2005, 2008)]
+    both_encodings.extend(['/2004-06/', '/2004-07/', '/2004-08/', '/2004-09/',
+                           '/2004-10/', '/2004-11/', '/2004-12/'])
+    if any(both_encodings) and 'iso' in f:
+            return False
+    return True
+
+
+def get_zip_files(paths):
+    for path in paths:
+        for root, dirnames, filenames in os.walk(path):
+            for filename in filenames:
+                filepath = os.path.join(root, filename)
+                if not check_file(filepath):
+                    continue
+                yield filepath
 
 
 def get_text(path):
     zf = zipfile.ZipFile(path)
     files = zf.namelist()
-    return zf.read(files[0]).decode('latin1')
+    codec = 'latin1'
+    if 'utf-8' in path.lower() or 'utf8' in path.lower():
+        codec = 'utf-8'
+    return zf.read(files[0]).decode(codec)
 
 
-def get_docs(path, filters=None):
+def get_docs(paths, filters=None):
     parser = TextTedParser(filters=filters)
-    for filename in get_zip_files(path):
+    for filename in get_zip_files(paths):
         for doc in parser.get_docs(get_text(filename)):
             doc['filename'] = filename
             yield doc
 
 
-def main(path):
+def main(*paths):
     first = True
-    docs = get_docs(path, {'document_document_type_code': '7'})
+    docs = get_docs(paths, {'document_document_type_code': '7'})
     sys.stdout.write('[')
     for doc in docs:
         # print '&' * 20
@@ -352,6 +374,7 @@ def main(path):
             # pass
             sys.stdout.write(',')
         sys.stdout.write(json.dumps(doc))
+        # print json.dumps(doc, indent=4)
         # print '&' * 20
     sys.stdout.write(']')
 
